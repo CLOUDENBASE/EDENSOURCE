@@ -69,6 +69,11 @@ CREATE TABLE IF NOT EXISTS dmfiles (
 CREATE TABLE IF NOT EXISTS dmreactions (
   msg_muuid TEXT, emoji TEXT, name TEXT, ts INTEGER,
   PRIMARY KEY(msg_muuid, emoji, name));
+CREATE TABLE IF NOT EXISTS eden_numbers (
+  number TEXT PRIMARY KEY, name TEXT, ts INTEGER);
+CREATE TABLE IF NOT EXISTS call_signals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, to_number TEXT, from_number TEXT,
+  type TEXT, data TEXT, ts INTEGER);
 """
 
 
@@ -158,6 +163,40 @@ class H(BaseHTTPRequestHandler):
                 conn.execute("DELETE FROM presence WHERE name=?", ((q.get("name") or [None])[0],))
                 conn.commit()
                 self._send({"ok": True})
+            elif parsed.path == "/api/spots":
+                muuid = (q.get("muuid") or [None])[0]
+                r = conn.execute("SELECT id FROM spots WHERE muuid=?", (muuid,)).fetchone()
+                if r:
+                    conn.execute("DELETE FROM vibes WHERE spot_id=?", (r["id"],))
+                    conn.execute("DELETE FROM quality WHERE spot_id=?", (r["id"],))
+                    conn.execute("DELETE FROM closed WHERE spot_id=?", (r["id"],))
+                    conn.execute("DELETE FROM spots WHERE muuid=?", (muuid,))
+                    conn.commit()
+                self._send({"ok": True})
+            elif parsed.path == "/api/events":
+                muuid = (q.get("muuid") or [None])[0]
+                r = conn.execute("SELECT id FROM events WHERE muuid=?", (muuid,)).fetchone()
+                if r:
+                    conn.execute("DELETE FROM rsvps WHERE event_id=?", (r["id"],))
+                    conn.execute("DELETE FROM events WHERE muuid=?", (muuid,))
+                    conn.commit()
+                self._send({"ok": True})
+            elif parsed.path == "/api/listings":
+                conn.execute("DELETE FROM listings WHERE muuid=?", ((q.get("muuid") or [None])[0],))
+                conn.commit()
+                self._send({"ok": True})
+            elif parsed.path == "/api/posts":
+                muuid = (q.get("muuid") or [None])[0]
+                r = conn.execute("SELECT id FROM posts WHERE muuid=?", (muuid,)).fetchone()
+                if r:
+                    conn.execute("DELETE FROM comments WHERE post_id=?", (r["id"],))
+                    conn.execute("DELETE FROM posts WHERE muuid=?", (muuid,))
+                    conn.commit()
+                self._send({"ok": True})
+            elif parsed.path == "/api/comments":
+                conn.execute("DELETE FROM comments WHERE id=?", ((q.get("id") or [None])[0],))
+                conn.commit()
+                self._send({"ok": True})
             else:
                 self._send({"error": "unknown route"}, 404)
         finally:
@@ -220,6 +259,21 @@ class H(BaseHTTPRequestHandler):
             elif p == "/api/dmreactions":
                 self._send([{"muuid": r["msg_muuid"], "emoji": r["emoji"], "name": r["name"], "on": 1, "ts": r["ts"]}
                             for r in conn.execute("SELECT msg_muuid, emoji, name, ts FROM dmreactions ORDER BY ts ASC")])
+            elif p == "/api/edennumbers":
+                qnum = q.get("number", "")
+                if qnum:
+                    r = conn.execute("SELECT number, name, ts FROM eden_numbers WHERE number=?", (qnum,)).fetchone()
+                    self._send({"number": r["number"], "name": r["name"], "ts": r["ts"]} if r else {"available": True})
+                else:
+                    self._send([{"number": r["number"], "name": r["name"]}
+                                for r in conn.execute("SELECT number, name FROM eden_numbers ORDER BY ts DESC LIMIT 500")])
+            elif p == "/api/callsignal":
+                fnum, since = q.get("for", ""), int(q.get("since", "0") or 0)
+                conn.execute("DELETE FROM call_signals WHERE ts<?", (int(time.time() * 1000) - 300000,))
+                conn.commit()
+                self._send([{"id": r["id"], "from": r["from_number"], "type": r["type"],
+                             "data": r["data"], "ts": r["ts"]}
+                            for r in conn.execute("SELECT id, from_number, type, data, ts FROM call_signals WHERE to_number=? AND id>? ORDER BY id ASC", (fnum, since))])
             elif p == "/api/announcements":
                 self._send([{"muuid": r["muuid"], "by": r["by_name"], "text": r["text"], "ts": r["ts"]}
                             for r in conn.execute("SELECT muuid, by_name, text, ts FROM announcements ORDER BY ts DESC LIMIT 50")])
@@ -426,6 +480,32 @@ class H(BaseHTTPRequestHandler):
                             (muuid, emoji, name))
                     conn.commit()
                 self._send({"ok": True})
+            elif p == "/api/edennumbers":
+                num = ''.join(c for c in str(b.get("number", "")) if c.isdigit())[:10]
+                nm = str(b.get("name", ""))[:40]
+                if num and nm:
+                    try:
+                        conn.execute("INSERT INTO eden_numbers (number, name, ts) VALUES (?,?,?)",
+                                     (num, nm, int(time.time() * 1000)))
+                        conn.commit()
+                        self._send({"ok": True, "number": num})
+                    except sqlite3.IntegrityError:
+                        self._send({"ok": False, "taken": True})
+                else:
+                    self._send({"ok": False})
+            elif p == "/api/callsignal":
+                to_n = ''.join(c for c in str(b.get("to", "")) if c.isdigit())[:10]
+                fr_n = ''.join(c for c in str(b.get("from", "")) if c.isdigit())[:10]
+                typ = str(b.get("type", ""))[:20]
+                data = str(b.get("data", ""))[:6000]
+                if to_n and typ in ("offer", "answer", "ice", "hangup", "ringing"):
+                    cur = conn.execute(
+                        "INSERT INTO call_signals (to_number, from_number, type, data, ts) VALUES (?,?,?,?,?)",
+                        (to_n, fr_n, typ, data, int(time.time() * 1000)))
+                    conn.commit()
+                    self._send({"ok": True, "id": cur.lastrowid})
+                else:
+                    self._send({"ok": False})
             elif p == "/api/dmfiles":
                 conn.execute(
                     "INSERT OR IGNORE INTO dmfiles (muuid, sender, recipient, iv, ctext, ts, chunked, chunks) VALUES (?,?,?,?,?,?,?,?)",
