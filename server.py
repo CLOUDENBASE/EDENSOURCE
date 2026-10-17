@@ -260,7 +260,7 @@ class H(BaseHTTPRequestHandler):
                 self._send([{"muuid": r["msg_muuid"], "emoji": r["emoji"], "name": r["name"], "on": 1, "ts": r["ts"]}
                             for r in conn.execute("SELECT msg_muuid, emoji, name, ts FROM dmreactions ORDER BY ts ASC")])
             elif p == "/api/edennumbers":
-                qnum = q.get("number", "")
+                qnum = (q.get("number") or [""])[0]
                 if qnum:
                     r = conn.execute("SELECT number, name, ts FROM eden_numbers WHERE number=?", (qnum,)).fetchone()
                     self._send({"number": r["number"], "name": r["name"], "ts": r["ts"]} if r else {"available": True})
@@ -268,7 +268,8 @@ class H(BaseHTTPRequestHandler):
                     self._send([{"number": r["number"], "name": r["name"]}
                                 for r in conn.execute("SELECT number, name FROM eden_numbers ORDER BY ts DESC LIMIT 500")])
             elif p == "/api/callsignal":
-                fnum, since = q.get("for", ""), int(q.get("since", "0") or 0)
+                fnum = (q.get("for") or [""])[0]
+                since = int((q.get("since") or ["0"])[0] or 0)
                 conn.execute("DELETE FROM call_signals WHERE ts<?", (int(time.time() * 1000) - 300000,))
                 conn.commit()
                 self._send([{"id": r["id"], "from": r["from_number"], "type": r["type"],
@@ -319,6 +320,24 @@ class H(BaseHTTPRequestHandler):
                     self._send({"have": [r["idx"] for r in
                                          conn.execute("SELECT idx FROM dmfile_chunks WHERE file_muuid=? ORDER BY idx", (f,))]})
             elif p == "/api/app-version":
+                if method == "POST":
+                    # Push an update from the EDEN MASTER app. Key via UPDATE_KEY env var.
+                    try:
+                        body = json.loads(self._body() or "{}")
+                        want = os.environ.get("UPDATE_KEY", "")
+                        if not want or body.get("key") != want:
+                            self._send({"ok": False, "error": "bad key"}, 403); return
+                        v = int(body.get("version", 0))
+                        if v <= 0 or not body.get("url"):
+                            self._send({"ok": False, "error": "need version + url"}, 400); return
+                        manifest = {"version": v, "url": str(body["url"])[:500],
+                                    "notes": str(body.get("notes", ""))[:2000]}
+                        vp = os.path.join(os.path.dirname(__file__), "version.json")
+                        with open(vp, "w") as f:
+                            json.dump(manifest, f, indent=2)
+                        self._send({"ok": True, "version": v}); return
+                    except Exception as e:
+                        self._send({"ok": False, "error": str(e)[:120]}, 400); return
                 try:
                     with open(os.path.join(os.path.dirname(__file__), "version.json")) as f:
                         self._send(json.load(f))
