@@ -1,5 +1,5 @@
 {
-  "version": 48,
-  "url": "https://muse.ai/files/1295195110332898/1775016146883723/afhgucbjl6cjnsonwdmrt176/EdenEverywhere-v48.apk",
-  "notes": "Map fixed (Leaflet back + satellite toggle), broadcast delete in both apps, Call tab title fix."
+  "version": 55,
+  "url": "https://muse.ai/files/1295195110332898/2142465563010529/bosrfk0fi6neo20j07hc09eo/EdenEverywhere-v55.apk",
+  "notes": "Clickable names everywhere (groups, market, events) -> profile -> DM. Map pin zooms to you, profile pic pins, user counter."
 }
