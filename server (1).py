@@ -197,6 +197,10 @@ class H(BaseHTTPRequestHandler):
                 conn.execute("DELETE FROM comments WHERE id=?", ((q.get("id") or [None])[0],))
                 conn.commit()
                 self._send({"ok": True})
+            elif parsed.path == "/api/announcements":
+                conn.execute("DELETE FROM announcements WHERE muuid=?", ((q.get("muuid") or [None])[0],))
+                conn.commit()
+                self._send({"ok": True})
             else:
                 self._send({"error": "unknown route"}, 404)
         finally:
