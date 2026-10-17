@@ -1,6 +1,6 @@
 FROM python:3.12-slim
 WORKDIR /app
-COPY server.py .
+COPY server.py version.json ./
 ENV PORT=8080 EE_DB=/data/eden.db
 VOLUME /data
 EXPOSE 8080
