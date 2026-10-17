@@ -163,6 +163,40 @@ class H(BaseHTTPRequestHandler):
                 conn.execute("DELETE FROM presence WHERE name=?", ((q.get("name") or [None])[0],))
                 conn.commit()
                 self._send({"ok": True})
+            elif parsed.path == "/api/spots":
+                muuid = (q.get("muuid") or [None])[0]
+                r = conn.execute("SELECT id FROM spots WHERE muuid=?", (muuid,)).fetchone()
+                if r:
+                    conn.execute("DELETE FROM vibes WHERE spot_id=?", (r["id"],))
+                    conn.execute("DELETE FROM quality WHERE spot_id=?", (r["id"],))
+                    conn.execute("DELETE FROM closed WHERE spot_id=?", (r["id"],))
+                    conn.execute("DELETE FROM spots WHERE muuid=?", (muuid,))
+                    conn.commit()
+                self._send({"ok": True})
+            elif parsed.path == "/api/events":
+                muuid = (q.get("muuid") or [None])[0]
+                r = conn.execute("SELECT id FROM events WHERE muuid=?", (muuid,)).fetchone()
+                if r:
+                    conn.execute("DELETE FROM rsvps WHERE event_id=?", (r["id"],))
+                    conn.execute("DELETE FROM events WHERE muuid=?", (muuid,))
+                    conn.commit()
+                self._send({"ok": True})
+            elif parsed.path == "/api/listings":
+                conn.execute("DELETE FROM listings WHERE muuid=?", ((q.get("muuid") or [None])[0],))
+                conn.commit()
+                self._send({"ok": True})
+            elif parsed.path == "/api/posts":
+                muuid = (q.get("muuid") or [None])[0]
+                r = conn.execute("SELECT id FROM posts WHERE muuid=?", (muuid,)).fetchone()
+                if r:
+                    conn.execute("DELETE FROM comments WHERE post_id=?", (r["id"],))
+                    conn.execute("DELETE FROM posts WHERE muuid=?", (muuid,))
+                    conn.commit()
+                self._send({"ok": True})
+            elif parsed.path == "/api/comments":
+                conn.execute("DELETE FROM comments WHERE id=?", ((q.get("id") or [None])[0],))
+                conn.commit()
+                self._send({"ok": True})
             else:
                 self._send({"error": "unknown route"}, 404)
         finally:
@@ -226,7 +260,7 @@ class H(BaseHTTPRequestHandler):
                 self._send([{"muuid": r["msg_muuid"], "emoji": r["emoji"], "name": r["name"], "on": 1, "ts": r["ts"]}
                             for r in conn.execute("SELECT msg_muuid, emoji, name, ts FROM dmreactions ORDER BY ts ASC")])
             elif p == "/api/edennumbers":
-                qnum = q.get("number", "")
+                qnum = (q.get("number") or [""])[0]
                 if qnum:
                     r = conn.execute("SELECT number, name, ts FROM eden_numbers WHERE number=?", (qnum,)).fetchone()
                     self._send({"number": r["number"], "name": r["name"], "ts": r["ts"]} if r else {"available": True})
@@ -234,7 +268,8 @@ class H(BaseHTTPRequestHandler):
                     self._send([{"number": r["number"], "name": r["name"]}
                                 for r in conn.execute("SELECT number, name FROM eden_numbers ORDER BY ts DESC LIMIT 500")])
             elif p == "/api/callsignal":
-                fnum, since = q.get("for", ""), int(q.get("since", "0") or 0)
+                fnum = (q.get("for") or [""])[0]
+                since = int((q.get("since") or ["0"])[0] or 0)
                 conn.execute("DELETE FROM call_signals WHERE ts<?", (int(time.time() * 1000) - 300000,))
                 conn.commit()
                 self._send([{"id": r["id"], "from": r["from_number"], "type": r["type"],
