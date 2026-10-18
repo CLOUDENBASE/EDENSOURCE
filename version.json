@@ -1,5 +1,5 @@
 {
-  "version": 59,
-  "url": "https://muse.ai/files/1295195110332898/1777974816659136/ts5z672lwrzqwb8puylymsnc/EdenEverywhere-v59.apk",
-  "notes": "State-of-the-art call UI: DTMF tones, button beeps, labeled in-call buttons, mid-call keypad, bulletproof end button. Missed calls use server time (25s stale filter). DM green-apple badge, 15s DM poll, transit status. Map auto-refresh 10s."
+  "version": 60,
+  "url": "https://muse.ai/files/1295195110332898/2640815569687080/4302piu20g6p7sth9p279xc4/EdenEverywhere-v60.apk",
+  "notes": "Drawer redesign: vibrant African color-coded sections, orderly layout, apple toggles (green on / red off)."
 }
