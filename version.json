@@ -1,5 +1,5 @@
 {
-  "version": 58,
-  "url": "https://muse.ai/files/1295195110332898/1655307325970756/13aei8fvnaqj87kkxecn2gmv/EdenEverywhere-v58.apk",
-  "notes": "MediaStash is now a display: visitor counter (who viewed what), tidy showcase for passersby, video streams / files download. Calls survive background + speaker toggle."
+  "version": 59,
+  "url": "https://muse.ai/files/1295195110332898/1777974816659136/ts5z672lwrzqwb8puylymsnc/EdenEverywhere-v59.apk",
+  "notes": "State-of-the-art call UI: DTMF tones, button beeps, labeled in-call buttons, mid-call keypad, bulletproof end button. Missed calls use server time (25s stale filter). DM green-apple badge, 15s DM poll, transit status. Map auto-refresh 10s."
 }
