@@ -10,13 +10,47 @@ Deploy:       see Dockerfile + render.yaml (one-click on Render)
 """
 import json
 import os
+import re
 import sqlite3
 import time
+import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs
 
 DB_PATH = os.environ.get("EE_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "eden.db"))
 PORT = int(os.environ.get("PORT", "8080"))
+
+# Upload key: when set (Render env), POST /api/channel and POST /api/channel-media
+# require it (JSON field "key", multipart field "key", or ?key= query param).
+# When empty, uploads are open (local dev mode).
+UPDATE_KEY = os.environ.get("UPDATE_KEY", "")
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MEDIA_DIR = os.path.join(BASE_DIR, "channel_media")
+MAX_MEDIA_BYTES = 500 * 1024 * 1024  # 500MB cap for channel video uploads
+
+MEDIA_TYPES = {
+    ".mp4": "video/mp4", ".webm": "video/webm", ".3gp": "video/3gpp",
+    ".m4v": "video/x-m4v", ".mov": "video/quicktime",
+    ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+    ".gif": "image/gif", ".webp": "image/webp",
+    ".mp3": "audio/mpeg", ".m4a": "audio/mp4", ".ogg": "audio/ogg",
+    ".wav": "audio/wav",
+}
+
+
+class _TooLarge(Exception):
+    pass
+
+
+def _key_ok(q, body):
+    """True when uploads are open (no UPDATE_KEY) or the key matches via
+    query param, JSON body field, or multipart field."""
+    if not UPDATE_KEY:
+        return True
+    qk = (q.get("key") or [None])[0]
+    bk = body.get("key") if isinstance(body, dict) else None
+    return qk == UPDATE_KEY or bk == UPDATE_KEY
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS spots (
@@ -74,6 +108,9 @@ CREATE TABLE IF NOT EXISTS eden_numbers (
 CREATE TABLE IF NOT EXISTS call_signals (
   id INTEGER PRIMARY KEY AUTOINCREMENT, to_number TEXT, from_number TEXT,
   type TEXT, data TEXT, ts INTEGER);
+CREATE TABLE IF NOT EXISTS acquaintances (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  from_name TEXT, to_name TEXT, status TEXT DEFAULT 'pending', ts INTEGER);
 """
 
 
@@ -87,7 +124,8 @@ def db():
                  "ALTER TABLE dmfiles ADD COLUMN chunked INTEGER DEFAULT 0",
                  "ALTER TABLE dmfiles ADD COLUMN chunks INTEGER DEFAULT 0",
                  "ALTER TABLE bios ADD COLUMN photo TEXT",
-                 "ALTER TABLE channel_items ADD COLUMN live INTEGER DEFAULT 0"):
+                 "ALTER TABLE channel_items ADD COLUMN live INTEGER DEFAULT 0",
+                 "ALTER TABLE bios ADD COLUMN showacq INTEGER DEFAULT 0"):
         try:
             conn.execute(_ddl)
         except Exception:
@@ -144,6 +182,252 @@ class H(BaseHTTPRequestHandler):
             return json.loads(raw or b"{}")
         except ValueError:
             return {}
+
+    # ---------- ∞ channel media hosting (v8) ----------
+
+    def _parse_multipart(self, max_bytes):
+        """Stream a multipart/form-data body, writing the 'file' part straight
+        to disk in channel_media/ without holding it in memory.
+        Returns (saved_name, fields). Raises _TooLarge / ValueError."""
+        ctype = self.headers.get("Content-Type", "")
+        bnd = None
+        for seg in ctype.split(";"):
+            seg = seg.strip()
+            if seg.startswith("boundary="):
+                bnd = seg[len("boundary="):].strip().strip('"')
+        if not bnd:
+            raise ValueError("no multipart boundary")
+        delim = ("--" + bnd).encode()
+        try:
+            total = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            total = 0
+        if total <= 0 or total > max_bytes + 4 * 1024 * 1024:
+            raise ValueError("bad content length")
+        os.makedirs(MEDIA_DIR, exist_ok=True)
+
+        fields = {}
+        saved_name = None
+        fout = None
+        written = 0
+        partial_path = None
+        buf = bytearray()
+        read_left = total
+        state = "preamble"  # preamble -> after_delim -> headers -> data -> done
+        cur_name = None
+        cur_is_file = False
+        field_buf = bytearray()
+
+        def close_partial():
+            nonlocal fout, partial_path
+            try:
+                if fout:
+                    fout.close()
+            except Exception:
+                pass
+            fout = None
+            if partial_path:
+                try:
+                    os.remove(partial_path)
+                except Exception:
+                    pass
+                partial_path = None
+
+        try:
+            while True:
+                if state == "done":
+                    break
+                if read_left > 0 and len(buf) < 65536 + len(delim) + 8:
+                    chunk = self.rfile.read(min(65536, read_left))
+                    if not chunk:
+                        break
+                    read_left -= len(chunk)
+                    buf += chunk
+                if state == "preamble":
+                    i = buf.find(delim)
+                    if i < 0:
+                        keep = len(delim) + 4
+                        if len(buf) > keep:
+                            del buf[:-keep]
+                        if read_left == 0:
+                            break
+                        continue
+                    del buf[:i + len(delim)]
+                    state = "after_delim"
+                elif state == "after_delim":
+                    if len(buf) < 2:
+                        if read_left == 0:
+                            break
+                        continue
+                    if bytes(buf[:2]) == b"--":
+                        state = "done"
+                        break
+                    if bytes(buf[:2]) == b"\r\n":
+                        del buf[:2]
+                        state = "headers"
+                    else:
+                        raise ValueError("malformed multipart")
+                elif state == "headers":
+                    i = buf.find(b"\r\n\r\n")
+                    if i < 0:
+                        if len(buf) > 65536 or read_left == 0:
+                            raise ValueError("bad part headers")
+                        continue
+                    hdr = bytes(buf[:i]).decode("utf-8", "replace")
+                    del buf[:i + 4]
+                    cur_name = None
+                    cur_filename = None
+                    for line in hdr.split("\r\n"):
+                        if line.lower().startswith("content-disposition:"):
+                            m = re.search(r'name="([^"]*)"', line)
+                            if m:
+                                cur_name = m.group(1)
+                            m = re.search(r'filename="([^"]*)"', line)
+                            if m:
+                                cur_filename = m.group(1)
+                    cur_is_file = (cur_name == "file" and bool(cur_filename))
+                    if cur_is_file:
+                        safe = re.sub(r"[^A-Za-z0-9._-]", "_",
+                                      os.path.basename(cur_filename))[:80]
+                        if not safe or safe.startswith("."):
+                            safe = "upload.bin"
+                        saved_name = uuid.uuid4().hex[:12] + "_" + safe
+                        partial_path = os.path.join(MEDIA_DIR, saved_name)
+                        fout = open(partial_path, "wb")
+                        written = 0
+                    else:
+                        field_buf = bytearray()
+                    state = "data"
+                elif state == "data":
+                    needle = b"\r\n" + delim
+                    i = buf.find(needle)
+                    if i < 0:
+                        keep = len(needle) + 4
+                        if len(buf) > keep:
+                            chunk = bytes(buf[:-keep])
+                            del buf[:-keep]
+                            if cur_is_file:
+                                if written + len(chunk) > max_bytes:
+                                    raise _TooLarge()
+                                fout.write(chunk)
+                                written += len(chunk)
+                            else:
+                                field_buf += chunk
+                        if read_left == 0:
+                            # unterminated; flush what we have
+                            if len(buf):
+                                if cur_is_file:
+                                    if written + len(buf) > max_bytes:
+                                        raise _TooLarge()
+                                    fout.write(bytes(buf))
+                                    written += len(buf)
+                                else:
+                                    field_buf += buf
+                                buf.clear()
+                            break
+                        continue
+                    chunk = bytes(buf[:i])
+                    del buf[:i + len(needle)]
+                    if cur_is_file:
+                        if written + len(chunk) > max_bytes:
+                            raise _TooLarge()
+                        fout.write(chunk)
+                        written += len(chunk)
+                        fout.close()
+                        fout = None
+                        partial_path = None  # complete; keep it
+                    else:
+                        field_buf += chunk
+                        if cur_name:
+                            fields[cur_name] = bytes(field_buf).decode("utf-8", "replace")
+                    state = "after_delim"
+            # drain any unread tail so the connection stays clean
+            while read_left > 0:
+                chunk = self.rfile.read(min(65536, read_left))
+                if not chunk:
+                    break
+                read_left -= len(chunk)
+        except _TooLarge:
+            close_partial()
+            raise
+        except Exception:
+            close_partial()
+            raise
+        if fout:
+            fout.close()
+        return saved_name, fields
+
+    def _handle_channel_media(self, q):
+        # early reject on a wrong query-string key before touching the body
+        qkey = (q.get("key") or [None])[0]
+        if UPDATE_KEY and qkey is not None and qkey != UPDATE_KEY:
+            self._send({"error": "bad key"}, 403)
+            return
+        try:
+            saved, fields = self._parse_multipart(MAX_MEDIA_BYTES)
+        except _TooLarge:
+            self._send({"error": "file too large (500MB max)"}, 413)
+            return
+        except Exception:
+            self._send({"error": "bad upload"}, 400)
+            return
+        if not saved:
+            self._send({"error": "no file"}, 400)
+            return
+        key = qkey if qkey is not None else fields.get("key")
+        if UPDATE_KEY and key != UPDATE_KEY:
+            try:
+                os.remove(os.path.join(MEDIA_DIR, saved))
+            except Exception:
+                pass
+            self._send({"error": "bad key"}, 403)
+            return
+        self._send({"ok": True, "url": "/media/" + saved})
+
+    def _serve_media(self, path):
+        size = os.path.getsize(path)
+        ctype = MEDIA_TYPES.get(os.path.splitext(path)[1].lower(),
+                                "application/octet-stream")
+        start, end = 0, size - 1
+        code = 200
+        rh = (self.headers.get("Range") or "").strip()
+        if rh:
+            m = re.match(r"bytes=(\d*)-(\d*)", rh)
+            if m:
+                s, e = m.group(1), m.group(2)
+                if s:
+                    start = int(s)
+                    end = int(e) if e else size - 1
+                elif e:
+                    start = max(0, size - int(e))
+                    end = size - 1
+                if start >= size or end >= size or start > end:
+                    self.send_response(416)
+                    self._cors()
+                    self.send_header("Content-Range", "bytes */%d" % size)
+                    self.end_headers()
+                    return
+                code = 206
+        length = end - start + 1
+        self.send_response(code)
+        self._cors()
+        self.send_header("Content-Type", ctype)
+        self.send_header("Accept-Ranges", "bytes")
+        if code == 206:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
+        self.send_header("Content-Length", str(length))
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        with open(path, "rb") as f:
+            f.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = f.read(min(65536, remaining))
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                remaining -= len(chunk)
 
     def do_OPTIONS(self):
         self.send_response(200)
@@ -281,6 +565,46 @@ class H(BaseHTTPRequestHandler):
                 self._send([{"id": r["id"], "from": r["from_number"], "type": r["type"],
                              "data": r["data"], "ts": r["ts"]}
                             for r in conn.execute("SELECT id, from_number, type, data, ts FROM call_signals WHERE to_number=? AND id>? ORDER BY id ASC", (fnum, since))])
+            elif p == "/api/acquaintances":
+                q = parse_qs(urlparse(self.path).query)
+                nm = (q.get("as") or [""])[0]
+                incoming = [{"from": r["from_name"], "ts": r["ts"]}
+                            for r in conn.execute(
+                                "SELECT from_name, ts FROM acquaintances WHERE to_name=? AND status='pending' ORDER BY ts DESC", (nm,))]
+                outgoing = [{"to": r["to_name"], "ts": r["ts"]}
+                            for r in conn.execute(
+                                "SELECT to_name, ts FROM acquaintances WHERE from_name=? AND status='pending' ORDER BY ts DESC", (nm,))]
+                acc = set()
+                for r in conn.execute(
+                        "SELECT to_name n FROM acquaintances WHERE from_name=? AND status='accepted'", (nm,)):
+                    acc.add(r["n"])
+                for r in conn.execute(
+                        "SELECT from_name n FROM acquaintances WHERE to_name=? AND status='accepted'", (nm,)):
+                    acc.add(r["n"])
+                try:
+                    srow = conn.execute("SELECT showacq FROM bios WHERE name=?", (nm,)).fetchone()
+                    show_pub = 1 if (srow and srow["showacq"]) else 0
+                except Exception:
+                    show_pub = 0
+                pub_acc = []
+                ffor = (q.get("for") or [""])[0]
+                if ffor:
+                    try:
+                        prow = conn.execute("SELECT showacq FROM bios WHERE name=?", (ffor,)).fetchone()
+                        if prow and prow["showacq"]:
+                            pset = set()
+                            for r in conn.execute(
+                                    "SELECT to_name n FROM acquaintances WHERE from_name=? AND status='accepted'", (ffor,)):
+                                pset.add(r["n"])
+                            for r in conn.execute(
+                                    "SELECT from_name n FROM acquaintances WHERE to_name=? AND status='accepted'", (ffor,)):
+                                pset.add(r["n"])
+                            pub_acc = sorted(pset)
+                    except Exception:
+                        pub_acc = []
+                self._send({"incoming": incoming, "outgoing": outgoing,
+                            "accepted": sorted(acc), "showPublic": show_pub,
+                            "pubAccepted": pub_acc})
             elif p == "/api/announcements":
                 self._send([{"muuid": r["muuid"], "by": r["by_name"], "text": r["text"], "ts": r["ts"]}
                             for r in conn.execute("SELECT muuid, by_name, text, ts FROM announcements ORDER BY ts DESC LIMIT 50")])
@@ -334,6 +658,18 @@ class H(BaseHTTPRequestHandler):
             elif p == "/api/stats":
                 self._send({t: conn.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
                             for t in ("spots", "events", "listings", "posts", "comments")})
+            elif p.startswith("/media/"):
+                name = p[len("/media/"):]
+                # block path traversal: saved names are uuid_hex + sanitized, no slashes
+                if (not name or "/" in name or "\\" in name or ".." in name
+                        or name.startswith(".")):
+                    self._send({"error": "not found"}, 404)
+                else:
+                    fpath = os.path.join(MEDIA_DIR, name)
+                    if not os.path.isfile(fpath):
+                        self._send({"error": "not found"}, 404)
+                    else:
+                        self._serve_media(fpath)
             else:
                 self._send({"error": "not found"}, 404)
         finally:
@@ -341,6 +677,11 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         p = urlparse(self.path).path
+        q = parse_qs(urlparse(self.path).query)
+        if p == "/api/channel-media":
+            # multipart upload; handled streaming, no _body() (would truncate)
+            self._handle_channel_media(q)
+            return
         b = self._body()
         conn = db()
         try:
@@ -513,6 +854,50 @@ class H(BaseHTTPRequestHandler):
                     self._send({"ok": True, "id": cur.lastrowid})
                 else:
                     self._send({"ok": False})
+            elif p == "/api/acquaintances":
+                act = str(b.get("action", ""))
+                frm = str(b.get("from", ""))[:40]
+                to = str(b.get("to", ""))[:40]
+                now = int(time.time() * 1000)
+                if act == "request" and frm and to and frm != to:
+                    ex = conn.execute(
+                        "SELECT id FROM acquaintances WHERE (from_name=? AND to_name=?) OR (from_name=? AND to_name=?)",
+                        (frm, to, to, frm)).fetchone()
+                    if not ex:
+                        conn.execute(
+                            "INSERT INTO acquaintances (from_name, to_name, status, ts) VALUES (?,?, 'pending', ?)",
+                            (frm, to, now))
+                        conn.commit()
+                    self._send({"ok": True})
+                elif act in ("accept", "decline") and frm and to:
+                    if act == "accept":
+                        conn.execute(
+                            "UPDATE acquaintances SET status='accepted' WHERE from_name=? AND to_name=? AND status='pending'",
+                            (frm, to))
+                    else:
+                        conn.execute(
+                            "DELETE FROM acquaintances WHERE from_name=? AND to_name=? AND status='pending'",
+                            (frm, to))
+                    conn.commit()
+                    self._send({"ok": True})
+                elif act == "remove" and frm and to:
+                    conn.execute(
+                        "DELETE FROM acquaintances WHERE (from_name=? AND to_name=?) OR (from_name=? AND to_name=?)",
+                        (frm, to, to, frm))
+                    conn.commit()
+                    self._send({"ok": True})
+                elif act == "setpublic" and frm:
+                    try:
+                        conn.execute("ALTER TABLE bios ADD COLUMN showacq INTEGER DEFAULT 0")
+                    except Exception:
+                        pass
+                    conn.execute(
+                        "INSERT INTO bios (name, showacq) VALUES (?, ?) ON CONFLICT(name) DO UPDATE SET showacq=excluded.showacq",
+                        (frm, 1 if str(to) == "1" else 0))
+                    conn.commit()
+                    self._send({"ok": True})
+                else:
+                    self._send({"ok": False})
             elif p == "/api/dmfiles":
                 conn.execute(
                     "INSERT OR IGNORE INTO dmfiles (muuid, sender, recipient, iv, ctext, ts, chunked, chunks) VALUES (?,?,?,?,?,?,?,?)",
@@ -548,13 +933,16 @@ class H(BaseHTTPRequestHandler):
                 conn.commit()
                 self._send({"ok": True})
             elif p == "/api/channel":
-                conn.execute(
-                    "INSERT OR IGNORE INTO channel_items (muuid, kind, title, text, media, link, by_name, ts, live) VALUES (?,?,?,?,?,?,?,?,?)",
-                    (b.get("muuid"), b.get("kind", "text"), b.get("title", ""), b.get("text", ""),
-                     b.get("media", ""), b.get("link", ""), b.get("by", ""), b.get("ts", int(time.time() * 1000)),
-                     b.get("live", 0)))
-                conn.commit()
-                self._send({"ok": True})
+                if not _key_ok(q, b):
+                    self._send({"error": "bad key"}, 403)
+                else:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO channel_items (muuid, kind, title, text, media, link, by_name, ts, live) VALUES (?,?,?,?,?,?,?,?,?)",
+                        (b.get("muuid"), b.get("kind", "text"), b.get("title", ""), b.get("text", ""),
+                         b.get("media", ""), b.get("link", ""), b.get("by", ""), b.get("ts", int(time.time() * 1000)),
+                         b.get("live", 0)))
+                    conn.commit()
+                    self._send({"ok": True})
             else:
                 self._send({"error": "not found"}, 404)
         finally:
